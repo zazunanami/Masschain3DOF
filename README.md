@@ -80,7 +80,7 @@ tests/
 
 docs/report/
   Report.pdf    # sanitized project report
-  ERRATA.md     # verified corrections to the report
+  ERRATA.md     # corrections applied to the report, with the model values behind them
 ```
 
 ## Known Limitations
@@ -95,7 +95,7 @@ A run is limited to 2,000,000 time steps. The RK4 integrator is plain Python (ro
 
 ## Reports and Documents
 
-A sanitized public copy of the project report is included at [docs/report/Report.pdf](docs/report/Report.pdf). Personal identifiers and course-submission metadata were removed from it. Some numerical claims, one frequency calculation, and several labels in the report do not match the model; the verified corrections are listed in [docs/report/ERRATA.md](docs/report/ERRATA.md).
+A sanitized public copy of the project report is included at [docs/report/Report.pdf](docs/report/Report.pdf). Personal identifiers and course-submission metadata were removed from it. Its numerical claims, calculations, and labels were checked against the model and corrected in place; [docs/report/ERRATA.md](docs/report/ERRATA.md) lists every change and the model values behind it. The simulation screenshots in the report were kept as they were.
 
 ## License
 
