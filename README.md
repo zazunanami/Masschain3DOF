@@ -63,7 +63,7 @@ python -m compileall src tests
 python -m pytest -q
 ```
 
-The included tests verify the equal-chain mass/stiffness matrices, natural frequencies, mass normalization, undamped modal energy conservation, and energy reduction under viscous damping.
+The included tests verify the equal-chain mass/stiffness matrices, natural frequencies, mass normalization, undamped modal energy conservation, energy reduction under viscous damping, RK4 agreement with the modal solution on non-divisible time grids, exact impulse transfer of the force pulse, agreement with the closed-form rectangular-pulse response, and the RK4 stability estimate.
 
 ## Project Structure
 
@@ -75,17 +75,20 @@ src/masschain3dof/
 
 tests/
   test_modal_core.py
+  test_time_domain.py
 ```
 
 ## Known Limitations
 
 This project is an educational numerical simulation. It is not certified for professional, safety-critical, or production engineering use. Results should be independently verified before any real-world use.
 
-The Coulomb friction model uses a smooth `tanh(v/eps)` approximation to avoid a discontinuity at zero velocity. The displayed mechanical energy is kinetic plus spring potential energy; dissipated energy is not separately accumulated.
+The Coulomb friction model uses a smooth `tanh(v/eps)` approximation to avoid a discontinuity at zero velocity. Near zero velocity this model is very stiff (slope `Fc/eps`), so small `eps` or large `Fc` values require a small time step; the app warns when the selected time step is outside the RK4 stability limit of the linearized model and refuses to plot diverged (non-finite) results. The displayed mechanical energy is kinetic plus spring potential energy; dissipated energy is not separately accumulated.
+
+The time grid always ends at the requested total time. If the total time is not an integer multiple of the time step, the step is shortened slightly so that every stored sample matches its plotted time. The rectangular force pulse acts on `0 <= t < Δt`; the RK4 step containing the pulse end is split there, so the applied impulse is exactly `F·Δt`.
 
 ## Reports and Documents
 
-No academic reports or submission documents are included in this public source release.
+A sanitized public copy of the project report is included at [docs/report/Report.pdf](docs/report/Report.pdf). Personal identifiers and course-submission metadata were removed from it; its numerical figures were produced by an earlier version of the code.
 
 ## License
 

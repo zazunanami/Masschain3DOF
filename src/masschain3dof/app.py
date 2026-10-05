@@ -53,7 +53,7 @@ def make_stiffness_matrix(springs):
 
 
 def solve_modal(M, K, negativeEigenTol=-1e-10):
-    """Solve the generalized eigenproblem:."""
+    """Solve the generalized eigenproblem K @ phi = omega**2 * M @ phi."""
     m_diag = np.diag(M).astype(float)
 
     # This should be caught by GUI validation
@@ -99,18 +99,43 @@ def mass_normalize(M, modes):
     return Phi
 
 
+# ------------ TIME GRID ------------
+
+def time_grid_intervals(t_end, dt):
+    """Number of uniform steps on [0, t_end] such that each step is <= dt."""
+    ratio = float(t_end) / float(dt)
+    n_intervals = int(round(ratio))
+
+    # Accept ratios that are integers up to round-off (e.g. 0.7 / 0.002 = 349.99999999999994);
+    # otherwise round up so the step is slightly shortened instead of overshooting dt.
+    if n_intervals < 1 or abs(ratio - n_intervals) > 1e-9 * ratio:
+        n_intervals = max(1, int(np.ceil(ratio)))
+
+    return n_intervals
+
+
+def make_time_grid(t_end, dt):
+    """Uniform sample times on [0, t_end].
+
+    When t_end is not an integer multiple of dt, the step is shortened to
+    t_end / ceil(t_end / dt), so the grid always ends at t_end and the solver
+    step equals the spacing of the returned samples.
+    """
+    return np.linspace(0.0, float(t_end), time_grid_intervals(t_end, dt) + 1)
+
+
 # ------------ MODAL TIME RESPONSE ------------
 
 def run_modal_sim(masses, springs, x0, v0, t_end, dt):
-    """Undamped free vibration via modal superposition:."""
+    """Undamped free vibration via modal superposition: x(t) = Phi @ q(t)."""
     M = make_mass_matrix(masses)
     K = make_stiffness_matrix(springs)
 
     omega, modes = solve_modal(M, K)
     Phi = mass_normalize(M, modes)
 
-    n_steps = int(t_end / dt) + 1
-    t = np.linspace(0.0, t_end, n_steps)
+    t = make_time_grid(t_end, dt)
+    n_steps = len(t)
 
     # modal initial conditions (mass-normalized projection)
     q0 = Phi.T @ (M @ x0)
@@ -158,7 +183,7 @@ def run_modal_sim(masses, springs, x0, v0, t_end, dt):
 # ------------ DAMPING & TIME-DOMAIN SIMULATION ------------
 
 def make_damping_matrix(dashpots):
-    """Viscous damping matrix C for the same chain topology as the springs:."""
+    """Viscous damping matrix C for the same chain topology as the springs."""
     c0, c1, c2, c3 = dashpots
 
     c11 = c0 + c1
@@ -177,22 +202,28 @@ def make_damping_matrix(dashpots):
 
 
 def force_pulse(t_now, dofIndex, F_imp, imp_dt):
-    """Simple rectangular force pulse: F for 0 <= t <= imp_dt on a single DOF."""
+    """Simple rectangular force pulse: F for 0 <= t < imp_dt on a single DOF."""
     f = np.zeros(3, dtype=float)
 
     # Use explicit condition structure for readability.
     if F_imp != 0.0 and imp_dt > 0.0:
-        if 0.0 <= t_now <= imp_dt:
+        if 0.0 <= t_now < imp_dt:
             f[dofIndex] = F_imp
 
     return f
 
 
-def coulomb_friction(v, fc_vec, smoothingEps):
-    """Regularized Coulomb friction:."""
+def friction_smoothing_eps(smoothingEps):
+    """Positive, finite smoothing velocity for the tanh friction model."""
     eps = float(smoothingEps) if smoothingEps is not None else 0.0
-    if eps <= 0.0:
-        eps = 1e-6  # fallback so we never divide by zero
+    if not np.isfinite(eps) or eps <= 0.0:
+        eps = 1e-6  # fallback so we never divide by zero (or by NaN)
+    return eps
+
+
+def coulomb_friction(v, fc_vec, smoothingEps):
+    """Regularized Coulomb friction: F = Fc * tanh(v / eps)."""
+    eps = friction_smoothing_eps(smoothingEps)
 
     return fc_vec * np.tanh(v / eps)
 
@@ -204,15 +235,21 @@ def run_time_sim(
     fc_vec, frictionEps,
     t_end, dt
 ):
-    """Time-domain simulation with viscous + Coulomb damping using RK4:."""
+    """Time-domain simulation with viscous + Coulomb damping using RK4.
+
+    Solves M x'' + C x' + K x = f_ext(t) - Fc * tanh(x' / eps).
+    The rectangular force pulse is held constant over each RK4 (sub)step and the
+    step containing the pulse end is split there, so the applied impulse is
+    exactly F_imp * imp_dt however imp_dt aligns with the time grid.
+    """
     M = make_mass_matrix(masses)
     K = make_stiffness_matrix(springs)
     C = make_damping_matrix(dashpots)
 
     Minv = np.linalg.inv(M)
 
-    n_steps = int(t_end / dt) + 1
-    t = np.linspace(0.0, t_end, n_steps)
+    t = make_time_grid(t_end, dt)
+    n_steps = len(t)
 
     x_hist = np.zeros((n_steps, 3), dtype=float)
     v_hist = np.zeros((n_steps, 3), dtype=float)
@@ -222,16 +259,18 @@ def run_time_sim(
     state[0:3] = x0
     state[3:6] = v0
 
-    def dstate_dt(t_now, sVec):
+    # End of the force pulse; 0.0 means no pulse, so no step is ever split.
+    pulseEnd = float(imp_dt) if (F_imp != 0.0 and imp_dt > 0.0) else 0.0
+
+    def dstate_dt(sVec, fExt):
         x = sVec[0:3]
         v = sVec[3:6]
 
         if DEBUG:
             # this gets spammy fast, so leave DEBUG off unless you're chasing a bug 
-            # print('t=', t_now, 'x=', x, 'v=', v)
+            # print('x=', x, 'v=', v)
             pass
 
-        fExt = force_pulse(t_now, imp_idx, F_imp, imp_dt)
         fCoulomb = coulomb_friction(v, fc_vec, frictionEps)
 
         acc = Minv @ (-C @ v - K @ x - fCoulomb + fExt)
@@ -241,8 +280,15 @@ def run_time_sim(
         dst[3:6] = acc
         return dst
 
+    def rk4_step(sVec, h, fExt):
+        k1 = dstate_dt(sVec, fExt)
+        k2 = dstate_dt(sVec + 0.5 * h * k1, fExt)
+        k3 = dstate_dt(sVec + 0.5 * h * k2, fExt)
+        k4 = dstate_dt(sVec + h * k3, fExt)
+
+        return sVec + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
     for i in range(n_steps):
-        t_i = t[i]
         x = state[0:3]
         v = state[3:6]
 
@@ -256,15 +302,69 @@ def run_time_sim(
         if i == n_steps - 1:
             break
 
-        h = dt
-        k1 = dstate_dt(t_i, state)
-        k2 = dstate_dt(t_i + 0.5 * h, state + 0.5 * h * k1)
-        k3 = dstate_dt(t_i + 0.5 * h, state + 0.5 * h * k2)
-        k4 = dstate_dt(t_i + h, state + h * k3)
+        t_i = t[i]
+        t_next = t[i + 1]
 
-        state = state + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        # Split the step at the pulse end so the force discontinuity lies on a sub-step boundary.
+        if t_i < pulseEnd < t_next:
+            subSteps = ((t_i, pulseEnd), (pulseEnd, t_next))
+        else:
+            subSteps = ((t_i, t_next),)
+
+        for t_a, t_b in subSteps:
+            # The pulse is constant inside a sub-step, so sampling its midpoint is unambiguous.
+            fExt = force_pulse(0.5 * (t_a + t_b), imp_idx, F_imp, imp_dt)
+            state = rk4_step(state, t_b - t_a, fExt)
 
     return t, x_hist, v_hist, E, M, K, C
+
+
+# ------------ RK4 STABILITY & SOLVER SELECTION ------------
+
+# The RK4 stability region contains the left half-disc |z| <= ~2.6; 2.5 leaves a small margin.
+RK4_SAFE_RADIUS = 2.5
+
+
+def rk4_amplification(z):
+    """RK4 stability function R(z) = 1 + z + z^2/2 + z^3/6 + z^4/24 (|R| > 1 means growth)."""
+    z = np.asarray(z, dtype=complex)
+    return 1.0 + z + z**2 / 2.0 + z**3 / 6.0 + z**4 / 24.0
+
+
+def linearized_state_eigenvalues(masses, springs, dashpots, fc_vec, frictionEps):
+    """Eigenvalues of the first-order system matrix [[0, I], [-M^-1 K, -M^-1 C_eff]].
+
+    Coulomb friction is linearized at v = 0, where tanh(v / eps) is stiffest,
+    so it adds Fc / eps to the diagonal of the damping matrix. The chain is
+    passive (K and C_eff positive semidefinite), so any positive real part is
+    eigen-solver round-off (e.g. a free-free rigid-body mode) and is clipped to 0.
+    """
+    M = make_mass_matrix(masses)
+    K = make_stiffness_matrix(springs)
+    C = make_damping_matrix(dashpots)
+
+    eps = friction_smoothing_eps(frictionEps)
+    C_eff = C + np.diag(np.asarray(fc_vec, dtype=float) / eps)
+
+    Minv = np.linalg.inv(M)
+    A = np.block(
+        [
+            [np.zeros((3, 3)), np.eye(3)],
+            [-Minv @ K, -Minv @ C_eff],
+        ]
+    )
+    lam = np.linalg.eigvals(A)
+    return np.minimum(lam.real, 0.0) + 1j * lam.imag
+
+
+def uses_time_domain(simMethod, viscousActive, coulombActive):
+    """Resolve the solver: Modal -> exact modal, Time-domain -> RK4, Auto -> RK4 only if damping is active."""
+    simMethodLower = str(simMethod).strip().lower()
+    if simMethodLower.startswith("modal"):
+        return False
+    if simMethodLower.startswith("time"):
+        return True
+    return bool(viscousActive or coulombActive)
 
 
 # ------------ GUI APPLICATION ------------
@@ -303,6 +403,7 @@ class MassChainModalApp(tk.Tk):
         self.animEnergyLine = None
         self.animFrameIndex = 0
         self.animMaxIndex = 0
+        self.animAfterId = None
 
         self.animSpeedVar = tk.DoubleVar(value=1.0)
         self.animXZoomVar = tk.DoubleVar(value=1.0)
@@ -775,6 +876,18 @@ class MassChainModalApp(tk.Tk):
     def on_parameters_changed(self, event=None):
         self.buttonAnimate.config(state="disabled")
         self.apply_ui_state()
+        self.stop_animation()
+
+    def stop_animation(self):
+        """Cancel the pending animation frame and close the animation window."""
+        if self.animAfterId is not None:
+            try:
+                self.after_cancel(self.animAfterId)
+            except (tk.TclError, ValueError) as exc:
+                if DEBUG:
+                    print('[debug] ignored UI/backend exception:', repr(exc))
+            self.animAfterId = None
+
         if self.animWindow is not None and self.animWindow.winfo_exists():
             self.animWindow.destroy()
         self.animWindow = None
@@ -803,11 +916,15 @@ class MassChainModalApp(tk.Tk):
 
     # ------------ INPUT / SIMULATION ------------
 
-    def _warn_time_step(self, masses, springs, t_end, dt):
-        """Warn about extreme dt choices:."""
+    def _warn_time_step(self, masses, springs, t_end, dt, rk4Damping=None):
+        """Warn about extreme dt choices and RK4 instability.
+
+        rk4Damping is (dashpots, frictionForces, frictionEps) when the RK4 solver
+        will run, or None when the exact modal solution is used.
+        """
         warnings = []
 
-        n_steps = int(t_end / dt) + 1
+        n_steps = time_grid_intervals(t_end, dt)
         if n_steps > 1_000_000:
             warnings.append(f"Very large step count ({n_steps:,}). This may be slow or run out of memory.")
 
@@ -837,6 +954,21 @@ class MassChainModalApp(tk.Tk):
         except (np.linalg.LinAlgError, ValueError):
             # If modal solve fails here, parameter validation will handle it later.
             pass
+
+        if rk4Damping is not None:
+            try:
+                dashpotsUsed, frictionUsed, frictionEps = rk4Damping
+                lam = linearized_state_eigenvalues(masses, springs, dashpotsUsed, frictionUsed, frictionEps)
+                growth = float(np.max(np.abs(rk4_amplification(lam * dt))))
+                if growth > 1.0 + 1e-9:
+                    dtStable = RK4_SAFE_RADIUS / float(np.max(np.abs(lam)))
+                    hint = " or increase the friction smoothing ε" if np.any(frictionUsed > 0.0) else ""
+                    warnings.append(
+                        f"Time step is too large for stable RK4 integration with the current stiffness/damping; "
+                        f"results will be wrong or diverge. Use dt ≤ {dtStable:.3g} s{hint}."
+                    )
+            except (np.linalg.LinAlgError, ValueError):
+                pass
 
         if warnings:
             messagebox.showwarning("Time Step Warning", "\n".join(warnings))
@@ -889,7 +1021,19 @@ class MassChainModalApp(tk.Tk):
         dashpots = np.array([c0, c1, c2, c3], dtype=float)
         frictionForces = np.array([Fc1, Fc2, Fc3], dtype=float)
 
-        if np.any(~np.isfinite(masses)) or np.any(~np.isfinite(springs)) or np.any(~np.isfinite(lengths)):
+        # Damping inputs only matter when the time-domain (RK4) solver can be selected.
+        dampingApplies = not simMethod.strip().lower().startswith("modal")
+        viscousUsed = enableViscous and dampingApplies
+        coulombUsed = enableCoulomb and dampingApplies
+
+        scalarInputs = np.array([impulseVelocity, F_imp, imp_dt, t_end, dt], dtype=float)
+        finiteInputs = (
+            np.all(np.isfinite(masses)) and np.all(np.isfinite(springs)) and np.all(np.isfinite(lengths))
+            and np.all(np.isfinite(scalarInputs))
+            and (not viscousUsed or np.all(np.isfinite(dashpots)))
+            and (not coulombUsed or (np.all(np.isfinite(frictionForces)) and np.isfinite(frictionEps)))
+        )
+        if not finiteInputs:
             messagebox.showerror("Input Error", "Parameters must be finite numbers (no NaN/Inf).")
             return None
 
@@ -913,15 +1057,15 @@ class MassChainModalApp(tk.Tk):
             messagebox.showerror("Input Error", "Total time and time step must be positive.")
             return None
 
-        if enableViscous and np.any(dashpots < 0.0):
+        if viscousUsed and np.any(dashpots < 0.0):
             messagebox.showerror("Input Error", "Dashpots (c0..c3) must be >= 0.")
             return None
 
-        if enableCoulomb and np.any(frictionForces < 0.0):
+        if coulombUsed and np.any(frictionForces < 0.0):
             messagebox.showerror("Input Error", "Coulomb friction Fc values must be >= 0.")
             return None
 
-        if enableCoulomb and frictionEps <= 0.0:
+        if coulombUsed and frictionEps <= 0.0:
             messagebox.showerror("Input Error", "Friction smoothing ε must be > 0.")
             return None
 
@@ -939,8 +1083,12 @@ class MassChainModalApp(tk.Tk):
             messagebox.showerror("Input Error", "Impulse mass selection is invalid.")
             return None
 
-        # --- Soft warnings (dt size, step count) ---
-        self._warn_time_step(masses, springs, t_end, dt)
+        # --- Soft warnings (dt size, step count, RK4 stability) ---
+        dashpotsUsed = dashpots if viscousUsed else np.zeros(4, dtype=float)
+        frictionUsed = frictionForces if coulombUsed else np.zeros(3, dtype=float)
+        timeDomain = uses_time_domain(simMethod, np.any(dashpotsUsed > 0.0), np.any(frictionUsed > 0.0))
+        rk4Damping = (dashpotsUsed, frictionUsed, frictionEps) if timeDomain else None
+        self._warn_time_step(masses, springs, t_end, dt, rk4Damping)
 
         return (masses, springs, lengths,
                 imp_idx, impulseVelocity, F_imp, imp_dt,
@@ -999,13 +1147,7 @@ class MassChainModalApp(tk.Tk):
         viscousActive = bool(enableViscous) and np.any(np.abs(dashpots) > 0.0)
         coulombActive = bool(enableCoulomb) and np.any(np.abs(frictionForces) > 0.0)
 
-        simMethodLower = str(simMethod).strip().lower()
-        if simMethodLower.startswith("modal"):
-            useTimeDomain = False
-        elif simMethodLower.startswith("time"):
-            useTimeDomain = True
-        else:
-            useTimeDomain = viscousActive or coulombActive
+        useTimeDomain = uses_time_domain(simMethod, viscousActive, coulombActive)
 
         useEquivalentDeltaV = bool(self.useEquivalentDeltaVVar.get())
 
@@ -1069,6 +1211,20 @@ class MassChainModalApp(tk.Tk):
 
         t1 = time.perf_counter()
         elapsed = t1 - t0
+
+        if not (np.all(np.isfinite(x_hist)) and np.all(np.isfinite(E))):
+            # RK4 blew up (dt beyond the stability limit); never plot or animate NaN/Inf data.
+            self.lastTimeArray = None
+            self.lastDisplacementArray = None
+            self.lastEnergyArray = None
+            self.buttonAnimate.config(state="disabled")
+            self.labelInfo.config(text="Simulation diverged (non-finite values). Reduce the time step.")
+            messagebox.showerror(
+                "Simulation Diverged",
+                "The time-domain integration produced non-finite values.\n"
+                "Reduce the time step (or increase the friction smoothing ε) and run again."
+            )
+            return
 
         # Geometry for animation
         L0, L1, L2, L3 = lengths
@@ -1153,7 +1309,7 @@ class MassChainModalApp(tk.Tk):
             text=f"{methodText}. {impulseText}\nExcited mass: {imp_idx+1}. Initial velocity used: {effectiveVelocity:.4f} m/s"
         )
         self.labelSimTime.config(
-            text=f"Simulated 0-{t_end:.3f} s in {elapsed:.3f} s  (steps: {len(t)})"
+            text=f"Simulated 0-{t_end:.3f} s in {elapsed:.3f} s  (steps: {len(t) - 1})"
         )
 
         # Pop-up details
@@ -1328,6 +1484,9 @@ class MassChainModalApp(tk.Tk):
         if self.animEqPositions is None:
             messagebox.showwarning("No Geometry", "Equilibrium positions are not set.")
             return
+
+        # Only one update loop may drive animFrameIndex; a second loop would double the playback speed.
+        self.stop_animation()
 
         self.animWindow = tk.Toplevel(self)
         self.animWindow.title("Mass Motion Animation")
@@ -1526,6 +1685,7 @@ class MassChainModalApp(tk.Tk):
 
     def schedule_animation_step(self):
         """Update animation frame with speed and zoom."""
+        self.animAfterId = None
         if self.animWindow is None or not self.animWindow.winfo_exists():
             return
         if self.animFrameIndex >= self.animMaxIndex:
@@ -1578,7 +1738,7 @@ class MassChainModalApp(tk.Tk):
         if delayMs < 1:
             delayMs = 1
 
-        self.after(delayMs, self.schedule_animation_step)
+        self.animAfterId = self.after(delayMs, self.schedule_animation_step)
 
 
 if __name__ == "__main__":
