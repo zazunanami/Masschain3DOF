@@ -5,7 +5,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.ticker import MaxNLocator, FormatStrFormatter
+from matplotlib.ticker import MaxNLocator, ScalarFormatter
 from matplotlib.patches import Rectangle
 
 
@@ -16,6 +16,15 @@ from matplotlib.patches import Rectangle
 # ------------------------------------------------------------
 DEBUG = False  # Set to True for diagnostic console output.
 
+# Eigenvalues smaller than this fraction of the largest one are round-off (double precision ~1e-16).
+EIGEN_ROUNDOFF_REL_TOL = 1e-12
+
+# Hard limit on time steps per run: RK4 needs ~40 us per step in pure Python and every
+# stored sample costs memory, so larger runs would freeze the GUI for minutes.
+MAX_TIME_STEPS = 2_000_000
+
+# Animation redraw period in milliseconds (~33 frames per second).
+ANIM_FRAME_MS = 30
 
 
 # ------------ MODEL & MODAL ANALYSIS ------------
@@ -66,16 +75,21 @@ def solve_modal(M, K, negativeEigenTol=-1e-10):
     A = Minv_sqrt @ K @ Minv_sqrt
     lam, U = np.linalg.eigh(A)  # real + sorted ascending (handy)
 
+    # Eigen-solver round-off scales with the largest eigenvalue, so "tiny" is judged
+    # relative to it; a purely absolute tolerance rejects valid stiff free-free chains.
+    roundOff = EIGEN_ROUNDOFF_REL_TOL * float(np.max(np.abs(lam)))
+
     # Numerical guard: allow tiny negative eigenvalues from round-off; reject invalid setups.
     min_lam = float(np.min(lam))
-    if min_lam < negativeEigenTol:
+    if min_lam < min(negativeEigenTol, -roundOff):
         raise ValueError(
             "Modal solve failed: negative eigenvalue detected. "
             "Double-check masses > 0, springs >= 0, and the topology."
         )
 
-    # clamp tiny negatives to zero so we don't get NaNs or zeros from sqrt
-    lam = np.where(lam < 0.0, 0.0, lam)
+    # Eigenvalues within round-off of zero are rigid-body modes (e.g. no wall springs):
+    # set them exactly to zero so they report omega = 0 instead of round-off noise.
+    lam = np.where(lam <= roundOff, 0.0, lam)
     omega = np.sqrt(lam)
 
     Phi = Minv_sqrt @ U  # already mass-normal-ish due to the transformation
@@ -404,6 +418,9 @@ class MassChainModalApp(tk.Tk):
         self.animFrameIndex = 0
         self.animMaxIndex = 0
         self.animAfterId = None
+        # Playback clock: simulated time on screen and the wall-clock time it was last advanced.
+        self.animSimTime = 0.0
+        self.animLastWallTime = 0.0
 
         self.animSpeedVar = tk.DoubleVar(value=1.0)
         self.animXZoomVar = tk.DoubleVar(value=1.0)
@@ -550,9 +567,16 @@ class MassChainModalApp(tk.Tk):
         controlCanvas.bind("<Configure>", on_canvas_configure)
 
         # Mouse wheel scrolling only while pointer is over the control panel or you cant scroll freely
+        wheelRemainder = [0.0]
+
         def on_mousewheel_windows(event):
-            # event.delta is typically 120 per notch on Windows
-            controlCanvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            # event.delta is 120 per notch on Windows; precision touchpads send smaller deltas,
+            # so accumulate fractions instead of truncating every event to zero units.
+            wheelRemainder[0] -= event.delta / 120.0
+            units = int(wheelRemainder[0])
+            if units != 0:
+                wheelRemainder[0] -= units
+                controlCanvas.yview_scroll(units, "units")
 
         def on_mousewheel_macos(event):
             # On macOS, event.delta is smaller and has opposite sign sometimes
@@ -569,10 +593,12 @@ class MassChainModalApp(tk.Tk):
             windowSystem = self.tk.call("tk", "windowingsystem")
             if windowSystem == "aqua":
                 self.bind_all("<MouseWheel>", on_mousewheel_macos)
+                # macOS reports horizontal swipes as Shift-MouseWheel; the panel only scrolls vertically.
+                self.bind_all("<Shift-MouseWheel>", lambda _event: None)
             else:
                 self.bind_all("<MouseWheel>", on_mousewheel_windows)
+                self.bind_all("<Shift-MouseWheel>", on_mousewheel_windows)
 
-            self.bind_all("<Shift-MouseWheel>", on_mousewheel_windows)
             self.bind_all("<Button-4>", on_mousewheel_linux_up)
             self.bind_all("<Button-5>", on_mousewheel_linux_down)
 
@@ -857,8 +883,14 @@ class MassChainModalApp(tk.Tk):
             self.entryFc1, self.entryFc2, self.entryFc3, self.entryFrictionEps,
             self.entryTotalTime, self.entryTimeStep
         ]
+        # A textvariable trace sees every edit (typing, paste, cut, middle-click paste),
+        # while <KeyRelease> misses mouse edits and would leave a stale animation enabled.
+        self.entryVars = []
         for entryWidget in entries:
-            entryWidget.bind("<KeyRelease>", self.on_parameters_changed)
+            entryVar = tk.StringVar(self, value=entryWidget.get())
+            entryWidget.configure(textvariable=entryVar)
+            entryVar.trace_add("write", lambda *_args: self.on_parameters_changed())
+            self.entryVars.append(entryVar)
 
         self.comboSimMethod.bind("<<ComboboxSelected>>", self.on_parameters_changed)
 
@@ -902,9 +934,10 @@ class MassChainModalApp(tk.Tk):
         self.axEnergy.set_ylabel("Mechanical Energy (J)")
         self.axEnergy.set_xlabel("Time (s)")
 
-        # Clean tick labels for energy axis (4 decimals, no scientific/offset). 4 is enough or it looks awfull
+        # Clean tick labels for energy axis: no offset text, precision follows the tick spacing
+        # (a fixed "%.4f" printed every tick of a small energy as 0.0000).
         try:
-            self.axEnergy.yaxis.set_major_formatter(FormatStrFormatter("%.4f"))
+            self.axEnergy.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
             self.axEnergy.yaxis.set_major_locator(MaxNLocator(nbins=6))
         except (tk.TclError, AttributeError, ValueError) as exc:
             # Some Tk/Matplotlib ops fail on certain backends/platforms; safe to ignore.
@@ -973,8 +1006,12 @@ class MassChainModalApp(tk.Tk):
         if warnings:
             messagebox.showwarning("Time Step Warning", "\n".join(warnings))
 
-    def get_parameters_from_gui(self):
-        """Read numeric parameters from GUI entries."""
+    def get_parameters_from_gui(self, checkTimeStep=True):
+        """Read numeric parameters from GUI entries.
+
+        checkTimeStep enables the step-count limit and the time-step warnings; it is
+        off for the modal-properties dialog, which does not use the time settings.
+        """
         try:
             m1 = float(self.entryM1.get())
             m2 = float(self.entryM2.get())
@@ -1083,12 +1120,23 @@ class MassChainModalApp(tk.Tk):
             messagebox.showerror("Input Error", "Impulse mass selection is invalid.")
             return None
 
-        # --- Soft warnings (dt size, step count, RK4 stability) ---
-        dashpotsUsed = dashpots if viscousUsed else np.zeros(4, dtype=float)
-        frictionUsed = frictionForces if coulombUsed else np.zeros(3, dtype=float)
-        timeDomain = uses_time_domain(simMethod, np.any(dashpotsUsed > 0.0), np.any(frictionUsed > 0.0))
-        rk4Damping = (dashpotsUsed, frictionUsed, frictionEps) if timeDomain else None
-        self._warn_time_step(masses, springs, t_end, dt, rk4Damping)
+        if checkTimeStep:
+            # --- Hard step limit (also catches an overflowing t_end / dt) ---
+            stepRatio = t_end / dt
+            if not np.isfinite(stepRatio) or time_grid_intervals(t_end, dt) > MAX_TIME_STEPS:
+                messagebox.showerror(
+                    "Input Error",
+                    f"Too many time steps (total time / time step ≈ {stepRatio:.3g}); "
+                    f"the limit is {MAX_TIME_STEPS:,}. Increase the time step or reduce the total time."
+                )
+                return None
+
+            # --- Soft warnings (dt size, step count, RK4 stability) ---
+            dashpotsUsed = dashpots if viscousUsed else np.zeros(4, dtype=float)
+            frictionUsed = frictionForces if coulombUsed else np.zeros(3, dtype=float)
+            timeDomain = uses_time_domain(simMethod, np.any(dashpotsUsed > 0.0), np.any(frictionUsed > 0.0))
+            rk4Damping = (dashpotsUsed, frictionUsed, frictionEps) if timeDomain else None
+            self._warn_time_step(masses, springs, t_end, dt, rk4Damping)
 
         return (masses, springs, lengths,
                 imp_idx, impulseVelocity, F_imp, imp_dt,
@@ -1097,7 +1145,7 @@ class MassChainModalApp(tk.Tk):
                 enableCoulomb, frictionForces, frictionEps)
 
     def on_compute_modes(self):
-        params = self.get_parameters_from_gui()
+        params = self.get_parameters_from_gui(checkTimeStep=False)
         if params is None:
             return
 
@@ -1133,6 +1181,9 @@ class MassChainModalApp(tk.Tk):
         params = self.get_parameters_from_gui()
         if params is None:
             return
+
+        # A new run replaces the arrays an open animation is reading (different length -> IndexError).
+        self.stop_animation()
 
         (masses, springs, lengths,
          imp_idx, impulseVelocity, F_imp, imp_dt,
@@ -1219,6 +1270,16 @@ class MassChainModalApp(tk.Tk):
             self.lastEnergyArray = None
             self.buttonAnimate.config(state="disabled")
             self.labelInfo.config(text="Simulation diverged (non-finite values). Reduce the time step.")
+            self.labelSimTime.config(text="")
+
+            # Clear the previous run's curves so they are not mistaken for this run's result.
+            self.axDisp.cla()
+            self.axEnergy.cla()
+            self.axDisp.set_ylabel("Displacement (m)")
+            self.axEnergy.set_ylabel("Mechanical Energy (J)")
+            self.axEnergy.set_xlabel("Time (s)")
+            self.canvas.draw()
+
             messagebox.showerror(
                 "Simulation Diverged",
                 "The time-domain integration produced non-finite values.\n"
@@ -1276,8 +1337,9 @@ class MassChainModalApp(tk.Tk):
             yRange = float(yMax - yMin)
             energyMax = float(np.max(E)) if len(E) > 0 else 0.0
 
-            # Minimum visible range: 2% of max energy (or a small absolute floor).
-            minRange = max(1e-4, 0.02 * max(1e-12, abs(energyMax)))
+            # Minimum visible range: 2% of max energy, so round-off ripple of a conserved energy is
+            # not magnified. No absolute floor: a fixed 1e-4 J floor flattened small-energy curves.
+            minRange = 0.02 * abs(energyMax) if energyMax != 0.0 else 1.0
             if yRange < minRange:
                 yMid = 0.5 * (yMin + yMax)
                 self.axEnergy.set_ylim(yMid - 0.5 * minRange, yMid + 0.5 * minRange)
@@ -1285,9 +1347,9 @@ class MassChainModalApp(tk.Tk):
             # Some Tk/Matplotlib ops fail on certain backends/platforms; safe to ignore.
             if DEBUG:
                 print('[debug] ignored UI/backend exception:', repr(exc))
-        # Show clean tick labels: fixed 4 decimals, no scientific/offset formatting.
+        # Show clean tick labels: no offset text, precision follows the tick spacing.
         try:
-            self.axEnergy.yaxis.set_major_formatter(FormatStrFormatter("%.4f"))
+            self.axEnergy.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
             self.axEnergy.yaxis.set_major_locator(MaxNLocator(nbins=6))
         except (tk.TclError, AttributeError, ValueError) as exc:
             # Some Tk/Matplotlib ops fail on certain backends/platforms; safe to ignore.
@@ -1297,7 +1359,8 @@ class MassChainModalApp(tk.Tk):
 
         self.canvas.draw()
 
-        methodText = "Time-domain (damped)" if useTimeDomain else "Modal (undamped)"
+        # Name the solver, not the damping: Time-domain mode also runs with damping switched off.
+        methodText = "Time-domain (RK4)" if useTimeDomain else "Modal (undamped)"
         if useTimeDomain and useEquivalentDeltaV:
             impulseText = "Impulse: modal-equivalent Δv (no force pulse applied)."
         elif useTimeDomain:
@@ -1309,7 +1372,7 @@ class MassChainModalApp(tk.Tk):
             text=f"{methodText}. {impulseText}\nExcited mass: {imp_idx+1}. Initial velocity used: {effectiveVelocity:.4f} m/s"
         )
         self.labelSimTime.config(
-            text=f"Simulated 0-{t_end:.3f} s in {elapsed:.3f} s  (steps: {len(t) - 1})"
+            text=f"Simulated 0-{t_end:.4g} s in {elapsed:.3f} s  (steps: {len(t) - 1})"
         )
 
         # Pop-up details
@@ -1485,7 +1548,7 @@ class MassChainModalApp(tk.Tk):
             messagebox.showwarning("No Geometry", "Equilibrium positions are not set.")
             return
 
-        # Only one update loop may drive animFrameIndex; a second loop would double the playback speed.
+        # Close a previous animation window and stop its update loop, so only one loop ever runs.
         self.stop_animation()
 
         self.animWindow = tk.Toplevel(self)
@@ -1522,8 +1585,12 @@ class MassChainModalApp(tk.Tk):
         self.animDispAxis = fig.add_subplot(gridSpec[0, 1])
         self.animEnergyAxis = fig.add_subplot(gridSpec[1, 1], sharex=self.animDispAxis)
 
-        totalLength = max(self.animRightWall - self.animLeftWall, 1.0)
-        self.massWidth = 0.08 * totalLength
+        # Box size follows the chain length but stays narrower than the closest spacing, so the
+        # masses never look overlapped at equilibrium (a 1 m floor made short chains overlap).
+        totalLength = self.animRightWall - self.animLeftWall
+        nodePositions = np.concatenate(([self.animLeftWall], self.animEqPositions, [self.animRightWall]))
+        minSpacing = float(np.min(np.diff(nodePositions)))
+        self.massWidth = min(0.08 * totalLength, 0.5 * minSpacing)
         self.massHeight = 0.05 * totalLength
 
         # Walls
@@ -1566,7 +1633,7 @@ class MassChainModalApp(tk.Tk):
 
         # Clean tick labels for energy axis.
         try:
-            self.animEnergyAxis.yaxis.set_major_formatter(FormatStrFormatter("%.4f"))
+            self.animEnergyAxis.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
             self.animEnergyAxis.yaxis.set_major_locator(MaxNLocator(nbins=6))
         except (tk.TclError, AttributeError, ValueError) as exc:
             # Some Tk/Matplotlib ops fail on certain backends/platforms; safe to ignore.
@@ -1610,7 +1677,7 @@ class MassChainModalApp(tk.Tk):
         # Speed row
         speedFrame = ttk.Frame(ctrlFrame)
         speedFrame.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(speedFrame, text="Animation speed (0.2x - 5x)").pack(side=tk.LEFT)
+        ttk.Label(speedFrame, text="Animation speed (0.2x - 5x real time)").pack(side=tk.LEFT)
         speedScale = ttk.Scale(
             speedFrame,
             from_=0.2,
@@ -1671,25 +1738,45 @@ class MassChainModalApp(tk.Tk):
         self.animFrameIndex = 0
         self.animMaxIndex = len(self.lastTimeArray)
 
+        # Start the playback clock only now, after the (slow) window and figure setup.
+        self.animSimTime = float(self.lastTimeArray[0])
+        self.animLastWallTime = time.perf_counter()
         self.schedule_animation_step()
 
     def on_anim_restart(self):
-        if self.lastTimeArray is None:
+        if self.lastTimeArray is None or self.animWindow is None or not self.animWindow.winfo_exists():
             return
 
-        finished = self.animFrameIndex >= self.animMaxIndex
-        self.animFrameIndex = 0
-
-        if finished and self.animWindow is not None and self.animWindow.winfo_exists():
+        # Rewind the playback clock; re-arm the update loop if it already stopped at the last frame.
+        self.animSimTime = float(self.lastTimeArray[0])
+        self.animLastWallTime = time.perf_counter()
+        if self.animAfterId is None:
             self.schedule_animation_step()
 
     def schedule_animation_step(self):
-        """Update animation frame with speed and zoom."""
+        """Draw the frame for the current playback time and schedule the next one.
+
+        Playback follows the wall clock: at 1x one second of simulated time takes one
+        second, independent of dt and of how long a redraw takes (slow redraws skip samples).
+        """
         self.animAfterId = None
         if self.animWindow is None or not self.animWindow.winfo_exists():
             return
-        if self.animFrameIndex >= self.animMaxIndex:
-            return
+
+        speed = self.animSpeedVar.get()
+        if speed < 0.2:
+            speed = 0.2
+        if speed > 5.0:
+            speed = 5.0
+
+        # Advance the playback clock by the real time elapsed since the previous frame.
+        now = time.perf_counter()
+        self.animSimTime += (now - self.animLastWallTime) * speed
+        self.animLastWallTime = now
+
+        # Show the last sample at or before the playback time.
+        frameIndex = int(np.searchsorted(self.lastTimeArray, self.animSimTime, side="right")) - 1
+        self.animFrameIndex = min(max(frameIndex, 0), self.animMaxIndex - 1)
 
         disp = self.lastDisplacementArray[self.animFrameIndex, :]
         x_pos = self.animEqPositions + disp  # 3 masses
@@ -1727,18 +1814,10 @@ class MassChainModalApp(tk.Tk):
             if DEBUG:
                 print('[debug] draw_idle failed:', repr(exc))
 
-        self.animFrameIndex += 1
+        if self.animFrameIndex >= self.animMaxIndex - 1:
+            return  # last sample shown; "Restart animation" re-arms the loop
 
-        speed = self.animSpeedVar.get()
-        if speed < 0.2:
-            speed = 0.2
-
-        baseDelay = 30.0
-        delayMs = int(baseDelay / speed)
-        if delayMs < 1:
-            delayMs = 1
-
-        self.animAfterId = self.after(delayMs, self.schedule_animation_step)
+        self.animAfterId = self.after(ANIM_FRAME_MS, self.schedule_animation_step)
 
 
 if __name__ == "__main__":
